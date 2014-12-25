@@ -1,0 +1,476 @@
+#!/usr/bin/env python
+#coding=utf8
+import sys,getopt
+import os,time,ConfigParser,logging,commands
+from logging.handlers import TimedRotatingFileHandler
+import paramiko
+
+class Logger():
+    def __init__(self, path,  Flevel=None, Slevel=None):
+        self.logger = logging.getLogger(path)
+        self.logger.setLevel(logging.DEBUG)
+        fmt = logging.Formatter('[%(asctime)s] %(levelname)-8s %(message)s', '%Y-%m-%d %H:%M:%S')
+        if Flevel:
+            fh = TimedRotatingFileHandler(path, 'midnight', 1, 4)
+            fh.suffix = '%Y-%m-%d_%H:%M:%S.log'
+            fh.setFormatter(fmt)
+            fh.setLevel(Flevel)
+            self.logger.addHandler(fh)
+        if Slevel:
+            sh = logging.StreamHandler()
+            sh.setFormatter(fmt)
+            sh.setLevel(Slevel)
+            self.logger.addHandler(sh)
+
+    def debug(self,message):
+        self.logger.debug(message)
+
+    def info(self,message):
+        self.logger.info(message)
+
+    def warning(self,message):
+        self.logger.warning(message)
+
+    def error(self,message):
+        self.logger.error(message)
+
+    def critical(self,message):
+        self.logger.critical(message)
+
+class ssh():
+    def __init__(self, hostname, port, username, password=None, key_filename=None, timeout=5):
+        self.hostname = hostname
+        self.port = port
+        self.username = username
+        self.password = password
+        self.key_filename = key_filename
+        self.timeout= timeout
+        self.client = None
+        self.connect()
+
+    def connect(self):
+        if self.client is None:
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.client.connect(self.hostname, self.port, self.username, self.password, key_filename=self.key_filename, timeout=self.timeout)
+
+    def exec_command(self, cmd):
+        self.connect()
+        stdin, stdout, stderr = self.client.exec_command(cmd)
+        message = stdout.readlines()
+        error   = stderr.readlines()
+        if len(error) > 0:
+            result = False
+            msg = error
+        else:
+            result = True
+            msg = message
+        return result, msg
+
+    def upload(self, localpath, remotepath):
+        self.connect()
+        sftp = self.client.open_sftp()
+        sftp.put(localpath, remotepath)
+
+    def download(self, remotepath, localpath):
+        self.connect()
+        sftp = self.client.open_sftp()
+        sftp.get(remotepath, localpath)
+
+    def close(self):
+        self.client.close()
+
+class CheckZabbixServer():
+    def __init__(self, serverip, gateway, senderhost, key, value, port=10051, zbxsender='/usr/bin/zabbix_sender '):
+        self.serverip = serverip
+        self.gateway = gateway
+        self.senderhost = senderhost
+        self.key = key
+        self.value = value
+        self.port = port
+        self.zbxsender = zbxsender
+
+    def fpingzbx(self):
+        status, output = commands.getstatusoutput('/usr/sbin/fping ' + self.serverip)
+        if status > 0:
+            return False
+        else:
+            return True
+
+    def fpinggateway(self):
+        status, output = commands.getstatusoutput('/usr/sbin/fping ' + self.gateway)
+        if status > 0:
+            return False
+        else:
+            return True
+
+    def zabbix_sender(self):
+        cmd = "%s -z %s -s %s -k %s -o %s" %(self.zbxsender, self.serverip, self.senderhost, self.key, self.value)
+        status, output = commands.getstatusoutput(cmd)
+        if status > 0:
+            return False
+        else:
+            return True
+
+class RecoveryZabbixServer():
+    def __init__(self, serviceip, netmask, device, gateway, conn):
+        self.serviceip = serviceip
+        self.netmask = netmask
+        self.device = device
+        self.gateway = gateway
+        self.conn = conn
+
+    def checkip(self):
+        result, msg = self.conn.exec_command('sudo /sbin/ip addr | grep %s' %(self.serviceip))
+        if result:
+            try:
+                if self.serviceip in msg[0]:
+                    return True
+            except:
+                return False
+        else:
+            return False
+
+    def addip(self):
+        result, msg = self.conn.exec_command('sudo /sbin/ip addr add %s/%s dev %s' %(self.serviceip, self.netmask, self.device))
+        if result:
+            if bool(msg):  # return error message
+                return False
+            else:  # not message is best message
+                result, msg = self.conn.exec_command('sudo /sbin/arping -c 2 -I %s -s %s %s' %(self.device, self.serviceip, self.gateway))
+                return True
+        else:
+            return False
+
+    def delip(self):
+        result, msg = self.conn.exec_command('sudo /sbin/ip addr del %s/%s dev %s' %(self.serviceip, self.netmask, self.device))
+        if bool(msg):  # return error message
+            return False
+        else:  # not message is best message
+            return True
+
+    def checkzbx(self):
+        result, msg = self.conn.exec_command('sudo /etc/init.d/zabbix-server status')
+        if 'running' in msg[0]:
+            return True
+        elif 'stopped' in msg[0] or 'dead':
+            return False
+
+    def startzbx(self):
+        result, msg = self.conn.exec_command('sudo /etc/init.d/zabbix-server start')
+        time.sleep(30)
+        if self.checkzbx():
+            return True
+        else:
+            return False
+
+    def stopzbx(self):
+        result, msg = self.conn.exec_command('sudo /etc/init.d/zabbix-server stop')
+        time.sleep(30)
+        if self.checkzbx():
+            return False
+        else:
+            return True
+
+def createDaemon():
+    # create - fork 1
+    try:
+        if os.fork() > 0:
+            os._exit(0)
+    except OSError, error:
+        print 'fork #1 failed: %d (%s)' % (error.errno, error.strerror)
+        os._exit(1)
+
+    # it separates the son from the father
+    os.chdir('/')
+    os.setsid()
+    os.umask(0)
+
+    # create - fork 2
+    try:
+        pid = os.fork()
+        if pid > 0:
+            print 'Daemon PID %d' % pid
+            os._exit(0)
+    except OSError, error:
+        print 'fork #2 failed: %d (%s)' % (error.errno, error.strerror)
+        os._exit(1)
+
+    functionDaemon()
+
+def functionDaemon():
+    logfile = dict(configFile.items('log'))
+    zbxservice = dict(configFile.items('zbxservice'))
+    zbxhost = dict(configFile.items('zbxhost'))
+    zbxsender = dict(configFile.items('zbxsender'))
+    log = Logger(logfile['logfile'], logging.DEBUG)
+
+    while True:
+        log.info('Begin check zbx service.')
+        zbx = CheckZabbixServer(zbxservice['serviceip'], zbxservice['gateway'], zbxsender['hostname'], zbxsender['key'], zbxsender['value'])
+        fpinggateway = zbx.fpinggateway()
+        fpingzbx = zbx.fpingzbx()
+        zabbix_sender = zbx.zabbix_sender()
+
+        # 如果无法PING通网关，有可能 manager 本身有问题
+        if not fpinggateway:
+            log.error('Ping gateway status is [fail]')
+            time.sleep(30)
+            continue
+        else:
+            log.info('Ping gateway status is [ok]')
+
+        # 检测 masterhost 和 slavemaster 是否可以SSH
+        try:
+            if bool(zbxhost['pwd']):
+                masterconn = ssh(zbxhost['masterhost'], int(zbxhost['port']), zbxhost['user'], password=zbxhost['pwd'])
+            else:
+                masterconn = ssh(zbxhost['masterhost'], int(zbxhost['port']), zbxhost['user'], key_filename=zbxhost['sshkey'])
+        except:
+            masterconn = False
+
+        try:
+            if bool(zbxhost['pwd']):
+                slaveconn = ssh(zbxhost['slavehost'], int(zbxhost['port']), zbxhost['user'], password=zbxhost['pwd'])
+            else:
+                slaveconn = ssh(zbxhost['slavehost'], int(zbxhost['port']), zbxhost['user'], key_filename=zbxhost['sshkey'])
+        except:
+            slaveconn = False
+
+        if masterconn and slaveconn:
+            hoststatus = 'ok'
+        elif masterconn and not slaveconn:
+            hoststatus = 'masterhost_ok'
+        elif slaveconn and not masterconn:
+            hoststatus = 'slavehost_ok'
+        else:
+            log.error('SSH masterhost and slavehost fail. please check the config')
+            time.sleep(30)
+            continue
+
+        # 检测 zbx 的服务状态，如果OK，则进一步检测是否做主备切换
+        if fpingzbx:
+            log.info('Ping zbx service ip status is [ok]')
+            if zabbix_sender:  # 如果 zbx sender 正常，则表明 HA 状态正常， 需要检测是否要做主备切换
+                log.info('check zbx sender status is [ok]')
+                if hoststatus == 'ok' and zbxhost['failback'] == 'true':  # 两台服务器均存活并且设置需要抢占
+                    master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
+                    if master_recovery.checkip() and master_recovery.checkzbx():
+                        log.info('zbx server running the masterhost: %s' %(zbxhost['masterhost']))
+                        masterconn.close()
+                        slaveconn.close()
+                        log.info('End check zbx service.')
+                        time.sleep(30)
+                        continue
+                    else:  # 服务运行正常，但不在 masterhost 主机，准备主备切换
+                        log.info('masterhost and slavehost is alive, but zbx running slavehost, we try to change it run the masterhost.')
+                        slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
+                        # 停止 slavehost 上 zbx 服务
+                        if slave_recovery.stopzbx():
+                            log.info('stop zbx server on slavehost [ok]')
+                            if  slave_recovery.delip():
+                                log.info('del zbx service ip on slavehost [ok]')
+                            else:
+                                log.error('del zbx service ip on slavehost [fail]')
+                        else:
+                            log.error('stop zbx server on slavehost [fail]')
+                        # 启动 masterhost 上 zbx 服务
+                        if master_recovery.addip():
+                            log.info('add zbx service ip on masterhost [ok]')
+                            loop = 0
+                            while True:
+                                if loop == 5:
+                                    log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
+                                    # TODO: 需要发送告警短信
+                                    break
+                                if master_recovery.startzbx():
+                                    log.info('start zbx server on masterhost [ok]')
+                                    break
+                                else:
+                                    log.error('start zbx server on masterhost [fail]')
+                                loop += 1
+                        else:
+                            log.error('add zbx service ip on masterhost [fail]')
+                        masterconn.close()
+                        slaveconn.close()
+                        log.info('End check zbx service.')
+                        time.sleep(30)
+                        continue
+                elif hoststatus == 'masterhost_ok':  # 仅 masterhost 主机存活，则不需要做任何处理
+                    masterconn.close()
+                    log.info('End check zbx service.')
+                    time.sleep(30)
+                    continue
+                elif hoststatus == 'slavehost_ok':  # 仅 slavehost 主机存活，则不需要做任何处理
+                    slaveconn.close()
+                    log.info('End check zbx service.')
+                    time.sleep(30)
+                    continue
+            else:  # zbx 的服务 IP 正常，但 zbx sender 失败，有可能服务器夯死，或者 zbx 服务异常退出
+                zbxstatus = 'ip_ok_zbx_fail'
+        else:  # PING zbx 服务IP失败，有可能HA没有运行，也有可能某台服务器宕机
+            zbxstatus = 'ip_fail_zbx_fail'
+
+        # 服务器夯死，或者 zbx 服务异常退出的处理
+        if zbxstatus == 'ip_ok_zbx_fail':
+            log.error('zbx service ip ok, but zbx sender fail, we will try to fix the problem.')
+            if hoststatus == 'ok':  # 两台主机均存活
+                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
+                slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
+                if master_recovery.checkip():  # IP存在于 masterhost 主机
+                    start_zbx_server = 'masterhost'
+                    slaveconn.close()
+                elif slave_recovery.checkip():  # IP存在于 slavehost 主机
+                    start_zbx_server = 'slavehost'
+                    masterconn.close()
+            elif hoststatus == 'masterhost_ok':  # 仅 masterhost 存活
+                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
+                if master_recovery.checkip():  # IP存在于 masterhost 主机
+                    start_zbx_server = 'masterhost'
+                else:  # 仅 masterhost 主机存活，但IP存在于 slavehost 主机，强行启动服务可能导致脑裂
+                    log.critical('OOPS, Only the masterhost alive, but IP to exist in the slavehost, to start the service could to brain-split.')
+                    # TODO: 需要发送告警短信
+                    masterconn.close()
+                    time.sleep(30)
+                    continue
+            elif hoststatus == 'slavehost_ok':  # 仅 slavehost 存活
+                slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
+                if slave_recovery.checkip():  # IP存在于 masterhost 主机
+                    start_zbx_server = 'slavehost'
+                else:  # 仅 slavehost 主机存活，但IP存在于 masterhost 主机，强行启动服务可能导致脑裂
+                    log.critical('OOPS, Only the slavehost alive, but IP to exist in the masterhost, to start the service could to brain-split.')
+                    # TODO: 需要发送告警短信
+                    slaveconn.close()
+                    time.sleep(30)
+                    continue
+
+            if start_zbx_server == 'masterhost':  # 启动 masterhost 上 zbx 服务
+                if master_recovery.checkzbx():  # 服务运行中，有可能服务重启太慢或配置文件出错
+                    log.info('zbx server is running, please wait for the next check or check the config.')
+                else:  # 服务停止，需要重启 zbx 服务
+                    log.info('we have to restart the service on the masterhost.')
+                    loop = 0
+                    while True:
+                        if loop == 5:
+                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
+                            # TODO: 需要发送告警短信
+                            break
+                        if master_recovery.startzbx():
+                            log.info('start zbx server on masterhost [ok]')
+                            break
+                        else:
+                            log.error('start zbx server on masterhost [fail]')
+                        loop += 1
+                    masterconn.close()
+                    time.sleep(30)
+                    continue
+            elif start_zbx_server == 'slavehost': # 启动 slavehost 上 zbx 服务
+                if slave_recovery.checkzbx():  # 服务运行中，有可能服务重启太慢或配置文件出错
+                    log.info('zbx server is running, please wait for the next check or check the [zbxsender] config.')
+                else:  # 服务停止，需要重启 zbx 服务
+                    log.info('we have to restart the service on the slavehost.')
+                    loop = 0
+                    while True:
+                        if loop == 5:
+                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
+                            # TODO: 需要发送告警短信
+                            break
+                        if slave_recovery.startzbx():
+                            log.info('start zbx server on slavehost [ok]')
+                            break
+                        else:
+                            log.error('start zbx server on slavehost [fail]')
+                        loop += 1
+                    slaveconn.close()
+                    time.sleep(30)
+                    continue
+
+        # HA初始化，服务器宕机处理
+        if zbxstatus == 'ip_fail_zbx_fail':
+            log.info('zbx service HA init.')
+            if hoststatus == 'ok':  # 两台主机均存活，则初始化 zbx HA，让服务运行在 masterhost 主机
+                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
+                init_zbx_server = 'masterhost'
+            elif hoststatus == 'masterhost_ok':  # 仅 masterhost 存活
+                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
+                init_zbx_server = 'masterhost'
+            elif hoststatus == 'slavehost_ok':  # 仅 slavehost 存活
+                slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
+                init_zbx_server = 'slavehost'
+
+            if init_zbx_server == 'masterhost':  # 初始化 masterhost 上 zbx 服务
+                if master_recovery.addip():
+                    log.info('add zbx service ip: %s on host: %s [ok]' %(zbxservice['serviceip'], zbxhost['masterhost']))
+                    loop = 0
+                    while True:
+                        if loop == 5:
+                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
+                            # TODO: 需要发送告警短信
+                            break
+                        if master_recovery.startzbx():
+                            log.info('start zbx server on masterhost [ok]')
+                            break
+                        else:
+                            log.error('start zbx server on masterhost [fail]')
+                        loop += 1
+                else:
+                    log.error('add zbx service ip: %s on host: %s [fail]' %(zbxservice['serviceip'], zbxhost['masterhost']))
+                masterconn.close()
+                time.sleep(30)
+                continue
+            elif init_zbx_server == 'slavehost':  # 初始化 slavehost 上 zbx 服务
+                if slave_recovery.addip():
+                    log.info('add zbx service ip: %s on host: %s [ok]' %(zbxservice['serviceip'], zbxhost['slavehost']))
+                    loop = 0
+                    while True:
+                        if loop == 5:
+                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
+                            # TODO: 需要发送告警短信
+                            break
+                        if slave_recovery.startzbx():
+                            log.info('start zbx server on slavehost [ok]')
+                            break
+                        else:
+                            log.error('start zbx server on slavehost [fail]')
+                        loop += 1
+                else:
+                    log.error('add zbx service ip: %s on host: %s [fail]' %(zbxservice['serviceip'], zbxhost['slavehost']))
+                slaveconn.close()
+                time.sleep(30)
+                continue
+
+if __name__ == '__main__':
+    Usage= """
+zbxha version 0.1
+
+usage:   zbxha [ -c <configfile> | --config=configfile ] [ -h | --help ]
+
+"""
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'hc:', ['help', 'config='])
+    except:
+        print(Usage)
+        sys.exit(2)
+
+    if len(opts) < 1:
+        print(Usage)
+        sys.exit(2)
+
+    config = ''
+    for op,value in opts:
+        if op in ('-h', '--help'):
+            print(Usage)
+            sys.exit()
+        elif op in ('-c', '--config'):
+            config = value
+        else:
+            print(Usage)
+            sys.exit(2)
+
+    if os.path.isfile(config):
+        configFile = ConfigParser.ConfigParser(allow_no_value=True)
+        configFile.read(config)
+        createDaemon()
+    else:
+        print('Not found config file: %s' %(config))
+        sys.exit(2)
