@@ -441,10 +441,9 @@ def functionDaemon():
 
 if __name__ == '__main__':
     Usage= """
-zbxha version 0.1
-
-usage:   zbxha [ -c <configfile> | --config=configfile ] [ -h | --help ]
-
+zabbix server high availability solutions, can be used to manage virtual IP and zabbix server process.
+https://github.com/whmove/zbxHA
+usage: zbxha [ -c <configfile> | --config=configfile ] [ -h | --help ]
 """
     try:
         opts, args = getopt.getopt(sys.argv[1:], 'hc:', ['help', 'config='])
