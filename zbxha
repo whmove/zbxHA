@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #coding=utf8
-__project__ = 'argus'
+__project__ = 'zbxha'
 __author__ = 'liugl'
 __date__ = '08/12/2015'
 import sys,getopt
