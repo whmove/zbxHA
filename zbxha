@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 #coding=utf8
+__project__ = 'argus'
+__author__ = 'liugl'
+__date__ = '08/12/2015'
 import sys,getopt
 import os,time,ConfigParser,logging,commands
 from logging.handlers import TimedRotatingFileHandler
@@ -11,8 +14,9 @@ class Logger():
         self.logger.setLevel(logging.DEBUG)
         fmt = logging.Formatter('[%(asctime)s] %(levelname)-8s %(message)s', '%Y-%m-%d %H:%M:%S')
         if Flevel:
-            fh = TimedRotatingFileHandler(path, 'midnight', 1, 4)
-            fh.suffix = '%Y-%m-%d_%H:%M:%S.log'
+            fh = logging.FileHandler(path)
+            # fh = TimedRotatingFileHandler(path, 'midnight', 1, 4)
+            # fh.suffix = '%Y-%m-%d_%H:%M:%S.log'
             fh.setFormatter(fmt)
             fh.setLevel(Flevel)
             self.logger.addHandler(fh)
@@ -90,15 +94,15 @@ class CheckZabbixServer():
         self.port = port
         self.zbxsender = zbxsender
 
-    def fpingzbx(self):
-        status, output = commands.getstatusoutput('/usr/sbin/fping ' + self.serverip)
+    def fpinggateway(self):
+        status, output = commands.getstatusoutput('/usr/sbin/fping ' + self.gateway)
         if status > 0:
             return False
         else:
             return True
 
-    def fpinggateway(self):
-        status, output = commands.getstatusoutput('/usr/sbin/fping ' + self.gateway)
+    def fpingzbx(self):
+        status, output = commands.getstatusoutput('/usr/sbin/fping ' + self.serverip)
         if status > 0:
             return False
         else:
@@ -158,7 +162,7 @@ class RecoveryZabbixServer():
 
     def startzbx(self):
         result, msg = self.conn.exec_command('sudo /etc/init.d/zabbix-server start')
-        time.sleep(30)
+        time.sleep(10)
         if self.checkzbx():
             return True
         else:
@@ -166,7 +170,7 @@ class RecoveryZabbixServer():
 
     def stopzbx(self):
         result, msg = self.conn.exec_command('sudo /etc/init.d/zabbix-server stop')
-        time.sleep(30)
+        time.sleep(10)
         if self.checkzbx():
             return False
         else:
@@ -208,11 +212,9 @@ def functionDaemon():
     while True:
         log.info('Begin check zbx service.')
         zbx = CheckZabbixServer(zbxservice['serviceip'], zbxservice['gateway'], zbxsender['hostname'], zbxsender['key'], zbxsender['value'])
-        fpinggateway = zbx.fpinggateway()
-        fpingzbx = zbx.fpingzbx()
-        zabbix_sender = zbx.zabbix_sender()
 
-        # 如果无法PING通网关，有可能 manager 本身有问题
+        # 如果无法PING通网关，有可能 manager 服务器本身有问题
+        fpinggateway = zbx.fpinggateway()
         if not fpinggateway:
             log.error('Ping gateway status is [fail]')
             time.sleep(30)
@@ -221,6 +223,7 @@ def functionDaemon():
             log.info('Ping gateway status is [ok]')
 
         # 检测 masterhost 和 slavemaster 是否可以SSH
+        # log.info('Check master and slave ssh connection.')
         try:
             if bool(zbxhost['pwd']):
                 masterconn = ssh(zbxhost['masterhost'], int(zbxhost['port']), zbxhost['user'], password=zbxhost['pwd'])
@@ -239,205 +242,134 @@ def functionDaemon():
 
         if masterconn and slaveconn:
             hoststatus = 'ok'
+            log.info('master and slave ssh connection is [ok]')
+            master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
+            slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
         elif masterconn and not slaveconn:
             hoststatus = 'masterhost_ok'
+            log.info('master ssh connection is [ok], but slave is [fail]')
+            master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
         elif slaveconn and not masterconn:
             hoststatus = 'slavehost_ok'
+            log.info('salve ssh connection is [ok], but master is [ok]')
+            slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
         else:
-            log.error('SSH masterhost and slavehost fail. please check the config')
+            log.error('master and slave ssh connection is [fail]. please check the config')
             time.sleep(30)
             continue
 
-        # 检测 zbx 的服务状态，如果OK，则进一步检测是否做主备切换
+        # 检测 zbx 的虚 IP 、服务状态
+        fpingzbx = zbx.fpingzbx()
         if fpingzbx:
             log.info('Ping zbx service ip status is [ok]')
-            if zabbix_sender:  # 如果 zbx sender 正常，则表明 HA 状态正常， 需要检测是否要做主备切换
+            zabbix_sender = zbx.zabbix_sender()
+            if zabbix_sender:
                 log.info('check zbx sender status is [ok]')
-                if hoststatus == 'ok' and zbxhost['failback'] == 'true':  # 两台服务器均存活并且设置需要抢占
-                    master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
-                    if master_recovery.checkip() and master_recovery.checkzbx():
-                        log.info('zbx server running the masterhost: %s' %(zbxhost['masterhost']))
-                        masterconn.close()
-                        slaveconn.close()
-                        log.info('End check zbx service.')
-                        time.sleep(30)
-                        continue
-                    else:  # 服务运行正常，但不在 masterhost 主机，准备主备切换
-                        log.info('masterhost and slavehost is alive, but zbx running slavehost, we try to change it run the masterhost.')
-                        slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
-                        # 停止 slavehost 上 zbx 服务
-                        if slave_recovery.stopzbx():
-                            log.info('stop zbx server on slavehost [ok]')
-                            if  slave_recovery.delip():
-                                log.info('del zbx service ip on slavehost [ok]')
-                            else:
-                                log.error('del zbx service ip on slavehost [fail]')
-                        else:
-                            log.error('stop zbx server on slavehost [fail]')
-                        # 启动 masterhost 上 zbx 服务
-                        if master_recovery.addip():
-                            log.info('add zbx service ip on masterhost [ok]')
-                            loop = 0
-                            while True:
-                                if loop == 5:
-                                    log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
-                                    # TODO: 需要发送告警短信
-                                    break
-                                if master_recovery.startzbx():
-                                    log.info('start zbx server on masterhost [ok]')
-                                    break
-                                else:
-                                    log.error('start zbx server on masterhost [fail]')
-                                loop += 1
-                        else:
-                            log.error('add zbx service ip on masterhost [fail]')
-                        masterconn.close()
-                        slaveconn.close()
-                        log.info('End check zbx service.')
-                        time.sleep(30)
-                        continue
-                elif hoststatus == 'masterhost_ok':  # 仅 masterhost 主机存活，则不需要做任何处理
-                    masterconn.close()
-                    log.info('End check zbx service.')
-                    time.sleep(30)
-                    continue
-                elif hoststatus == 'slavehost_ok':  # 仅 slavehost 主机存活，则不需要做任何处理
-                    slaveconn.close()
-                    log.info('End check zbx service.')
-                    time.sleep(30)
-                    continue
-            else:  # zbx 的服务 IP 正常，但 zbx sender 失败，有可能服务器夯死，或者 zbx 服务异常退出
+                zbxstatus = 'ip_ok_zbx_ok'
+            else:
+                log.info('check zbx sender status is [fail]')
                 zbxstatus = 'ip_ok_zbx_fail'
-        else:  # PING zbx 服务IP失败，有可能HA没有运行，也有可能某台服务器宕机
-            zbxstatus = 'ip_fail_zbx_fail'
+        else:
+            log.info('Ping zbx service ip status is [fail]')
+            zbxstatus = 'ip_fail'
 
-        # 服务器夯死，或者 zbx 服务异常退出的处理
+        # 如果虚 IP 不存在，则初始化 zbx
+        if zbxstatus == 'ip_fail':
+            if hoststatus == 'ok':
+                log.info('master and slave ok, begin init zbx ha. please waiting...')
+                if master_recovery.checkzbx():
+                    master_recovery.stopzbx()
+                if slave_recovery.checkzbx():
+                    slave_recovery.stopzbx()
+                master_recovery.addip()
+                master_recovery.startzbx()
+                if master_recovery.checkip() and master_recovery.checkzbx():
+                    log.info('zbx init done, check status is [ok]')
+                else:
+                    log.info('zbx init done, but check status is [fail]')
+            if hoststatus == 'masterhost_ok':
+                if master_recovery.checkzbx():
+                    master_recovery.stopzbx()
+                log.info('master ok and slave fail, begin start zbx on master. please waiting...')
+                master_recovery.addip()
+                master_recovery.startzbx()
+                if master_recovery.checkip() and master_recovery.checkzbx():
+                    log.info('zbx start on master done, check status is [ok]')
+                else:
+                    log.info('zbx start on master done, but check status is [fail]')
+            if hoststatus == 'slavehost_ok':
+                if slave_recovery.checkzbx():
+                    slave_recovery.stopzbx()
+                log.info('master fail and slave ok, begin start zbx on slave.')
+                slave_recovery.addip()
+                slave_recovery.startzbx()
+                if slave_recovery.checkip() and slave_recovery.checkzbx():
+                    log.info('zbx start on slave done, check status is [ok]')
+                else:
+                    log.info('zbx start on slave done, but check status is [fail]')
+
+        # 如果虚 IP 存在，但服务 fail，则重启服务
         if zbxstatus == 'ip_ok_zbx_fail':
-            log.error('zbx service ip ok, but zbx sender fail, we will try to fix the problem.')
-            if hoststatus == 'ok':  # 两台主机均存活
-                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
-                slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
-                if master_recovery.checkip():  # IP存在于 masterhost 主机
-                    start_zbx_server = 'masterhost'
-                    slaveconn.close()
-                elif slave_recovery.checkip():  # IP存在于 slavehost 主机
-                    start_zbx_server = 'slavehost'
-                    masterconn.close()
-            elif hoststatus == 'masterhost_ok':  # 仅 masterhost 存活
-                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
-                if master_recovery.checkip():  # IP存在于 masterhost 主机
-                    start_zbx_server = 'masterhost'
-                else:  # 仅 masterhost 主机存活，但IP存在于 slavehost 主机，强行启动服务可能导致脑裂
-                    log.critical('OOPS, Only the masterhost alive, but IP to exist in the slavehost, to start the service could to brain-split.')
-                    # TODO: 需要发送告警短信
-                    masterconn.close()
-                    time.sleep(30)
-                    continue
-            elif hoststatus == 'slavehost_ok':  # 仅 slavehost 存活
-                slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
-                if slave_recovery.checkip():  # IP存在于 masterhost 主机
-                    start_zbx_server = 'slavehost'
-                else:  # 仅 slavehost 主机存活，但IP存在于 masterhost 主机，强行启动服务可能导致脑裂
-                    log.critical('OOPS, Only the slavehost alive, but IP to exist in the masterhost, to start the service could to brain-split.')
-                    # TODO: 需要发送告警短信
-                    slaveconn.close()
-                    time.sleep(30)
-                    continue
-
-            if start_zbx_server == 'masterhost':  # 启动 masterhost 上 zbx 服务
-                if master_recovery.checkzbx():  # 服务运行中，有可能服务重启太慢或配置文件出错
-                    log.info('zbx server is running, please wait for the next check or check the config.')
-                else:  # 服务停止，需要重启 zbx 服务
-                    log.info('we have to restart the service on the masterhost.')
-                    loop = 0
-                    while True:
-                        if loop == 5:
-                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
-                            # TODO: 需要发送告警短信
-                            break
-                        if master_recovery.startzbx():
-                            log.info('start zbx server on masterhost [ok]')
-                            break
-                        else:
-                            log.error('start zbx server on masterhost [fail]')
-                        loop += 1
-                    masterconn.close()
-                    time.sleep(30)
-                    continue
-            elif start_zbx_server == 'slavehost': # 启动 slavehost 上 zbx 服务
-                if slave_recovery.checkzbx():  # 服务运行中，有可能服务重启太慢或配置文件出错
-                    log.info('zbx server is running, please wait for the next check or check the [zbxsender] config.')
-                else:  # 服务停止，需要重启 zbx 服务
-                    log.info('we have to restart the service on the slavehost.')
-                    loop = 0
-                    while True:
-                        if loop == 5:
-                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
-                            # TODO: 需要发送告警短信
-                            break
-                        if slave_recovery.startzbx():
-                            log.info('start zbx server on slavehost [ok]')
-                            break
-                        else:
-                            log.error('start zbx server on slavehost [fail]')
-                        loop += 1
-                    slaveconn.close()
-                    time.sleep(30)
-                    continue
-
-        # HA初始化，服务器宕机处理
-        if zbxstatus == 'ip_fail_zbx_fail':
-            log.info('zbx service HA init.')
-            if hoststatus == 'ok':  # 两台主机均存活，则初始化 zbx HA，让服务运行在 masterhost 主机
-                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
-                init_zbx_server = 'masterhost'
-            elif hoststatus == 'masterhost_ok':  # 仅 masterhost 存活
-                master_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], masterconn)
-                init_zbx_server = 'masterhost'
-            elif hoststatus == 'slavehost_ok':  # 仅 slavehost 存活
-                slave_recovery = RecoveryZabbixServer(zbxservice['serviceip'], zbxservice['netmask'], zbxservice['device'], zbxservice['gateway'], slaveconn)
-                init_zbx_server = 'slavehost'
-
-            if init_zbx_server == 'masterhost':  # 初始化 masterhost 上 zbx 服务
-                if master_recovery.addip():
-                    log.info('add zbx service ip: %s on host: %s [ok]' %(zbxservice['serviceip'], zbxhost['masterhost']))
-                    loop = 0
-                    while True:
-                        if loop == 5:
-                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
-                            # TODO: 需要发送告警短信
-                            break
-                        if master_recovery.startzbx():
-                            log.info('start zbx server on masterhost [ok]')
-                            break
-                        else:
-                            log.error('start zbx server on masterhost [fail]')
-                        loop += 1
+            if hoststatus == 'ok':
+                log.info('master and slave ok,begin start zbx server on masterhost. please waiting...')
+                if master_recovery.checkip():
+                    master_recovery.startzbx()
+                if slave_recovery.checkip():
+                    slave_recovery.delip()
+                    master_recovery.addip()
+                    master_recovery.startzbx()
+                if master_recovery.checkip() and master_recovery.checkzbx():
+                    log.info('zbx start on master done, check status is [ok]')
                 else:
-                    log.error('add zbx service ip: %s on host: %s [fail]' %(zbxservice['serviceip'], zbxhost['masterhost']))
-                masterconn.close()
-                time.sleep(30)
-                continue
-            elif init_zbx_server == 'slavehost':  # 初始化 slavehost 上 zbx 服务
-                if slave_recovery.addip():
-                    log.info('add zbx service ip: %s on host: %s [ok]' %(zbxservice['serviceip'], zbxhost['slavehost']))
-                    loop = 0
-                    while True:
-                        if loop == 5:
-                            log.critical('OOPS, We try to start the zabbix service 5 times, but still failed, please wait next loop or check config.')
-                            # TODO: 需要发送告警短信
-                            break
-                        if slave_recovery.startzbx():
-                            log.info('start zbx server on slavehost [ok]')
-                            break
-                        else:
-                            log.error('start zbx server on slavehost [fail]')
-                        loop += 1
+                    log.info('zbx start on master done, but check status is [fail]')
+            if hoststatus == 'masterhost_ok': # 如果只有 master 可连，则将虚 IP 及服务启用在 master 上
+                log.info('master ok, begin start zbx server on masterhost. please waiting...')
+                master_recovery.startzbx()
+                if master_recovery.checkip() and master_recovery.checkzbx():
+                    log.info('zbx start on master done, check status is [ok]')
                 else:
-                    log.error('add zbx service ip: %s on host: %s [fail]' %(zbxservice['serviceip'], zbxhost['slavehost']))
-                slaveconn.close()
-                time.sleep(30)
-                continue
+                    log.info('zbx start on master done, but check status is [fail]')
+            if hoststatus == 'slavehost_ok': # 如果只有 slave 可连，则将虚 IP 及服务启用在 slave 上
+                log.info('slave ok, begin start zbx server on slavehost. please waiting...')
+                slave_recovery.startzbx()
+                if slave_recovery.checkip() and slave_recovery.checkzbx():
+                    log.info('zbx start on slave done, check status is [ok]')
+                else:
+                    log.info('zbx start on slave done, but check status is [fail]')
+
+        # 如果虚 IP 和服务都 ok，两台主机都可连接
+        if zbxstatus == 'ip_ok_zbx_ok' and hoststatus == 'ok':
+            if zbxhost['failback'] == 'true': # 如果设置抢占，则让 zbx 启用在 master 主机上
+                if master_recovery.checkip() and master_recovery.checkzbx():
+                    log.info('zbx server running the masterhost: %s' %(zbxhost['masterhost']))
+                else:
+                    log.info('zbx server running the slavehost, begin failback. please waiting...')
+                    slave_recovery.stopzbx()
+                    slave_recovery.delip()
+                    master_recovery.addip()
+                    master_recovery.startzbx()
+                    if master_recovery.checkip() and master_recovery.checkzbx():
+                        log.info('failback done, check status is [ok]')
+                    else:
+                        log.info('failback done, check status is [fail]')
+            if zbxhost['failback'] == 'false': # 如果未设置抢占，则输出当前服务运行主机
+                if master_recovery.checkip() and master_recovery.checkzbx():
+                    log.info('zbx server running the masterhost: %s' %(zbxhost['masterhost']))
+                elif slave_recovery.checkip() and slave_recovery.checkzbx():
+                    log.info('zbx server running the slavehost: %s' %(zbxhost['slavehost']))
+
+        # 清理现场，关闭所有的 SSH 连接
+        if hoststatus == 'ok':
+            masterconn.close()
+            slaveconn.close()
+        elif hoststatus == 'masterhost_ok':
+            masterconn.close()
+        elif hoststatus == 'slavehost_ok':
+            slaveconn.close()
+        log.info('check zbx server done.')
+        log.info('')
+        time.sleep(30)
+        continue
 
 if __name__ == '__main__':
     Usage= """
