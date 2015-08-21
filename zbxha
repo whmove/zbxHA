@@ -9,14 +9,14 @@ from logging.handlers import TimedRotatingFileHandler
 import paramiko
 
 class Logger():
-    def __init__(self, path,  Flevel=None, Slevel=None):
-        self.logger = logging.getLogger(path)
+    def __init__(self, filename,  Flevel=None, Slevel=None):
+        self.logger = logging.getLogger(filename)
         self.logger.setLevel(logging.DEBUG)
         fmt = logging.Formatter('[%(asctime)s] %(levelname)-8s %(message)s', '%Y-%m-%d %H:%M:%S')
         if Flevel:
-            fh = logging.FileHandler(path)
-            # fh = TimedRotatingFileHandler(path, 'midnight', 1, 4)
-            # fh.suffix = '%Y-%m-%d_%H:%M:%S.log'
+            # fh = logging.FileHandler(filename)
+            fh = TimedRotatingFileHandler(filename, when='midnight', interval=1, backupCount=15, encoding='utf-8')
+            fh.suffix = '%Y-%m-%d_%H:%M:%S.log'
             fh.setFormatter(fmt)
             fh.setLevel(Flevel)
             self.logger.addHandler(fh)
@@ -207,7 +207,7 @@ def functionDaemon():
     zbxservice = dict(configFile.items('zbxservice'))
     zbxhost = dict(configFile.items('zbxhost'))
     zbxsender = dict(configFile.items('zbxsender'))
-    log = Logger(logfile['logfile'], logging.DEBUG)
+    log = Logger(logfile['logfile'], Flevel=True)
 
     while True:
         log.info('Begin check zbx service.')
@@ -375,6 +375,7 @@ if __name__ == '__main__':
     Usage= """
 zabbix server high availability solutions, can be used to manage virtual IP and zabbix server process.
 https://github.com/whmove/zbxHA
+version: 0.1
 usage: zbxha [ -c <configfile> | --config=configfile ] [ -h | --help ]
 """
     try:
